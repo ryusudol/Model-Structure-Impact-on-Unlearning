@@ -848,6 +848,8 @@ def save_results(
     method_name = result.get("Method", "Unknown")
     result_id = result.get("ID", "0000")
 
+    output_dir = os.path.abspath(output_dir)
+    
     # Create output directory
     model_dir = os.path.join(output_dir, model_name)
     os.makedirs(model_dir, exist_ok=True)
