@@ -1,8 +1,3 @@
-"""
-Shared utilities for machine unlearning notebooks.
-Provides models, data loading, evaluation, UMAP, attack metrics, and result generation.
-"""
-
 import os
 import json
 import time
@@ -31,31 +26,30 @@ UMAP_N_NEIGHBORS = 9
 UMAP_MIN_DIST = 0.45
 UMAP_DATA_SIZE = 2000
 
-# Layer names for CKA computation (10 layers each to match)
 RESNET_LAYERS = [
-    'conv1',      # Initial convolution
-    'layer1.0',   # ResNet block 1, sub-block 0
-    'layer1.1',   # ResNet block 1, sub-block 1
-    'layer2.0',   # ResNet block 2, sub-block 0
-    'layer2.1',   # ResNet block 2, sub-block 1
-    'layer3.0',   # ResNet block 3, sub-block 0
-    'layer3.1',   # ResNet block 3, sub-block 1
-    'layer4.0',   # ResNet block 4, sub-block 0
-    'layer4.1',   # ResNet block 4, sub-block 1
-    'fc'          # Final classifier
+    'conv1',
+    'layer1.0',
+    'layer1.1',
+    'layer2.0',
+    'layer2.1',
+    'layer3.0',
+    'layer3.1',
+    'layer4.0',
+    'layer4.1',
+    'fc'
 ]
 
 VGG_LAYERS = [
-    'features.2',   # After first conv block (ReLU after conv1)
-    'features.5',   # After second conv block
-    'features.9',   # After third conv block
-    'features.12',  # Mid third block
-    'features.16',  # After fourth conv block
-    'features.19',  # Mid fourth block
-    'features.22',  # After fifth conv block
-    'features.26',  # Mid fifth block
-    'features.29',  # End of features
-    'head.fc'       # Final classifier
+    'features.2',
+    'features.5',
+    'features.9',
+    'features.12',
+    'features.16',
+    'features.19',
+    'features.22',
+    'features.26',
+    'features.29',
+    'head.fc' 
 ]
 
 # ============================================================================
@@ -63,17 +57,14 @@ VGG_LAYERS = [
 # ============================================================================
 
 def get_resnet18():
-    """Load pretrained ResNet-18 for CIFAR-10 from Hugging Face Hub."""
     from torchvision import models
     from huggingface_hub import hf_hub_download
-    
-    # Create CIFAR-10 adapted ResNet-18 (smaller input, no maxpool)
+
     model = models.resnet18(weights=None)
     model.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
     model.maxpool = nn.Identity()
     model.fc = nn.Linear(model.fc.in_features, NUM_CLASSES)
-    
-    # Load pretrained weights from Hugging Face Hub
+
     repo_id = "jaeunglee/resnet18-cifar10-unlearning"
     weights_path = hf_hub_download(repo_id=repo_id, filename="resnet18_cifar10_full.pth")
     state_dict = torch.load(weights_path, map_location='cpu', weights_only=True)
@@ -83,8 +74,6 @@ def get_resnet18():
 
 
 def get_vgg16bn():
-    """Load pretrained VGG-16-BN for CIFAR-10 from timm."""
-    # Use timm's standard VGG-16-BN and adapt for CIFAR-10
     model = timm.create_model("vgg16_bn", pretrained=True, num_classes=NUM_CLASSES)
     return model
 
@@ -866,7 +855,7 @@ def save_results(
     # Save JSON
     json_path = os.path.join(model_dir, f"{method_name}_{result_id}.json")
     with open(json_path, 'w') as f:
-        json.dump(result, f, indent=2)
+        json.dump(result, f, indent=2, default=float)
 
     # Save model weights
     weights_path = os.path.join(model_dir, f"{method_name}_{result_id}.pth")
