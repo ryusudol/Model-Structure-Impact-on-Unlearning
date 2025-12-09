@@ -13,6 +13,7 @@ import numpy as np
 from torchvision import datasets, transforms
 import timm
 import umap
+from torch_cka import CKA
 
 # ============================================================================
 # Configuration
@@ -66,15 +67,20 @@ def get_resnet18():
     model.fc = nn.Linear(model.fc.in_features, NUM_CLASSES)
 
     repo_id = "jaeunglee/resnet18-cifar10-unlearning"
+    print(f"  Downloading weights from {repo_id}...")
     weights_path = hf_hub_download(repo_id=repo_id, filename="resnet18_cifar10_full.pth")
+    print(f"  Loading weights from {weights_path}...")
     state_dict = torch.load(weights_path, map_location='cpu', weights_only=True)
     model.load_state_dict(state_dict)
-    
+    print("  Model loaded successfully.")
+
     return model
 
 
 def get_vgg16bn():
+    print("  Downloading VGG16-BN weights from timm...")
     model = timm.create_model("vgg16_bn", pretrained=True, num_classes=NUM_CLASSES)
+    print("  Model loaded successfully.")
     return model
 
 
@@ -385,13 +391,10 @@ def prepare_umap_points(
         is_forget = 1 if gt == forget_class else 0
         x, y = float(umap_embedding[i, 0]), float(umap_embedding[i, 1])
 
-        # Compress probabilities (only keep those > 0.001)
-        prob_dict = {}
-        for c in range(NUM_CLASSES):
-            if probs[i, c] > 0.001:
-                prob_dict[str(c)] = round(float(probs[i, c]), 4)
+        # Include all 10 class probabilities as a dict
+        prob_dict = {str(c): round(float(probs[i, c]), 3) for c in range(NUM_CLASSES)}
 
-        points.append([gt, pred, idx, is_forget, round(x, 4), round(y, 4), prob_dict])
+        points.append([gt, pred, idx, is_forget, round(x, 2), round(y, 2), prob_dict])
 
     return points
 
@@ -432,12 +435,15 @@ def compute_attack_metrics(
             for i in range(len(labels)):
                 p = probs[i].cpu().numpy()
                 entropy = -np.sum(p * np.log(p + 1e-10))
-                confidence = float(probs[i].max().item())
+
+                max_prob = float(probs[i].max().item())
+                other_prob = 1 - max_prob
+                confidence = np.log(max_prob + 1e-45) - np.log(other_prob + 1e-45)
 
                 values.append({
                     'img': sample_idx,
                     'entropy': round(entropy, 4),
-                    'confidence': round(confidence, 4)
+                    'confidence': round(confidence, 2)
                 })
 
                 if labels[i].item() == forget_class:
@@ -452,7 +458,9 @@ def compute_attack_metrics(
     # Calculate attack scores at different thresholds
     results = {
         'entropy_above_unlearn': [],
-        'confidence_above_unlearn': []
+        'entropy_above_retrain': [],
+        'confidence_above_unlearn': [],
+        'confidence_above_retrain': []
     }
 
     # Generate thresholds
@@ -474,22 +482,41 @@ def compute_attack_metrics(
             'attack_score': round(attack_score, 4)
         })
 
-    # Confidence-based thresholds
-    conf_thresholds = np.linspace(0, 1, 51)
-    for thresh in conf_thresholds:
-        # Lower confidence on forget class = better forgetting
-        forget_below = sum(1 for c in forget_confidences if c <= thresh)
-        retain_below = sum(1 for c in retain_confidences if c <= thresh)
+    # Placeholder retrain entropy scores (zeros since no retrain model)
+    for thresh in thresholds:
+        results['entropy_above_retrain'].append({
+            'threshold': round(float(thresh), 3),
+            'fpr': 0.0,
+            'fnr': 0.0,
+            'attack_score': 0.0
+        })
 
-        fpr = retain_below / len(retain_confidences) if retain_confidences else 0
-        tpr = forget_below / len(forget_confidences) if forget_confidences else 0
+    # Confidence-based thresholds (log-scaled range matching backend)
+    conf_thresholds = np.linspace(-2.50, 10.00, 51)
+    for thresh in conf_thresholds:
+        # Higher confidence on retain class vs forget class
+        forget_above = sum(1 for c in forget_confidences if c >= thresh)
+        retain_above = sum(1 for c in retain_confidences if c >= thresh)
+
+        tpr = forget_above / len(forget_confidences) if forget_confidences else 0
+        fpr = retain_above / len(retain_confidences) if retain_confidences else 0
+        fnr = 1.0 - tpr
         attack_score = 1 - abs(tpr - fpr)
 
         results['confidence_above_unlearn'].append({
             'threshold': round(float(thresh), 3),
-            'fpr': round(fpr, 4),
-            'tpr': round(tpr, 4),
-            'attack_score': round(attack_score, 4)
+            'fpr': round(fpr, 3),
+            'fnr': round(fnr, 3),
+            'attack_score': round(attack_score, 3)
+        })
+
+    # Placeholder retrain confidence scores (zeros since no retrain model)
+    for thresh in conf_thresholds:
+        results['confidence_above_retrain'].append({
+            'threshold': round(float(thresh), 3),
+            'fpr': 0.0,
+            'fnr': 0.0,
+            'attack_score': 0.0
         })
 
     # Forgetting Quality Score (FQS)
@@ -507,131 +534,6 @@ def compute_attack_metrics(
 # CKA Similarity (Layer-wise)
 # ============================================================================
 
-def linear_cka(X: np.ndarray, Y: np.ndarray) -> float:
-    """Compute linear Centered Kernel Alignment between two feature matrices."""
-    X = X - X.mean(axis=0)
-    Y = Y - Y.mean(axis=0)
-
-    dot_XX = np.sum(X * X)
-    dot_YY = np.sum(Y * Y)
-    dot_XY = np.sum(X * Y)
-
-    if dot_XX == 0 or dot_YY == 0:
-        return 0.0
-
-    return dot_XY / np.sqrt(dot_XX * dot_YY)
-
-
-def get_layer_activations_for_cka(
-    model: nn.Module,
-    loader: DataLoader,
-    layer_names: List[str],
-    device: torch.device
-) -> Dict[str, np.ndarray]:
-    """
-    Extract activations from specified layers for CKA computation.
-
-    Args:
-        model: The model to extract activations from
-        loader: DataLoader with input data
-        layer_names: List of layer names to extract activations from
-        device: Device to run on
-
-    Returns:
-        Dictionary mapping layer names to activation arrays
-    """
-    model.eval()
-    activations = {name: [] for name in layer_names}
-    hooks = []
-
-    def get_hook(name):
-        def hook(module, input, output):
-            act = output.detach()
-            if act.dim() > 2:
-                act = act.view(act.size(0), -1)
-            activations[name].append(act.cpu().numpy())
-        return hook
-
-    # Register hooks for each layer
-    for name in layer_names:
-        try:
-            # Navigate to the layer by name
-            parts = name.split('.')
-            module = model
-            for part in parts:
-                if part.isdigit():
-                    module = module[int(part)]
-                else:
-                    module = getattr(module, part)
-            hooks.append(module.register_forward_hook(get_hook(name)))
-        except (AttributeError, IndexError, KeyError):
-            print(f"Warning: Layer '{name}' not found in model, skipping")
-            continue
-
-    # Forward pass to collect activations
-    with torch.no_grad():
-        for inputs, _ in loader:
-            inputs = inputs.to(device)
-            _ = model(inputs)
-
-    # Remove hooks
-    for hook in hooks:
-        hook.remove()
-
-    # Concatenate activations
-    result = {}
-    for name in layer_names:
-        if activations[name]:
-            result[name] = np.concatenate(activations[name], axis=0)
-
-    return result
-
-
-def filter_loader_by_class(
-    loader: DataLoader,
-    target_class: int,
-    include_class: bool = True,
-    max_samples: int = None
-) -> DataLoader:
-    """
-    Filter a DataLoader to include/exclude a specific class.
-
-    Args:
-        loader: Original DataLoader
-        target_class: Class to filter
-        include_class: If True, keep only target_class; if False, exclude it
-        max_samples: Maximum number of samples to include (None for all)
-
-    Returns:
-        New DataLoader with filtered data
-    """
-    dataset = loader.dataset
-
-    # Get indices based on filter condition
-    indices = []
-    for i in range(len(dataset)):
-        _, label = dataset[i]
-        label_val = label if isinstance(label, int) else label.item()
-
-        if include_class and label_val == target_class:
-            indices.append(i)
-        elif not include_class and label_val != target_class:
-            indices.append(i)
-
-    # Apply max_samples limit
-    if max_samples is not None and len(indices) > max_samples:
-        generator = torch.Generator()
-        generator.manual_seed(SEED + target_class)
-        perm = torch.randperm(len(indices), generator=generator)
-        indices = [indices[i] for i in perm[:max_samples].tolist()]
-
-    if not indices:
-        return None
-
-    subset = Subset(dataset, indices)
-    return DataLoader(subset, batch_size=loader.batch_size, shuffle=False, num_workers=0)
-
-
 def compute_cka_similarity(
     model_unlearned: nn.Module,
     model_original: nn.Module,
@@ -639,10 +541,13 @@ def compute_cka_similarity(
     test_loader: DataLoader,
     forget_class: int,
     device: torch.device,
-    model_type: str = "resnet"
+    model_type: str = "resnet",
+    retrain_model: Optional[nn.Module] = None,
+    batch_size: int = 1000
 ) -> Dict[str, Any]:
     """
     Compute layer-wise CKA similarity between unlearned and original model.
+    Uses torch-cka library to match backend implementation.
 
     Args:
         model_unlearned: The unlearned model
@@ -652,74 +557,170 @@ def compute_cka_similarity(
         forget_class: The class that was unlearned
         device: Device to run on
         model_type: "resnet" or "vgg" to select appropriate layer names
+        retrain_model: Optional retrained model for additional comparison
+        batch_size: Batch size for CKA computation
 
     Returns:
-        Dictionary with structure:
+        Dictionary with structure matching backend:
         {
-            "layers": [...],
-            "train": {"forget_class": [[...], ...], "other_classes": [[...], ...]},
-            "test": {"forget_class": [[...], ...], "other_classes": [[...], ...]}
+            "similarity": {"layers": [...], "train": {...}, "test": {...}},
+            "similarity_retrain": {...} or None
         }
     """
     # Select layer names based on model type
     layer_names = RESNET_LAYERS if model_type.lower() == "resnet" else VGG_LAYERS
 
-    # Create filtered loaders
-    # Training data: use 1/10 of samples for efficiency
-    train_forget = filter_loader_by_class(train_loader, forget_class, include_class=True,
-                                          max_samples=len(train_loader.dataset) // 10)
-    train_other = filter_loader_by_class(train_loader, forget_class, include_class=False,
-                                         max_samples=len(train_loader.dataset) // 10)
+    def filter_loader(loader, is_train=False):
+        """Filter loader to create forget_class and other_classes loaders."""
+        targets = torch.tensor(loader.dataset.targets) if hasattr(loader.dataset, 'targets') else None
 
-    # Test data: use 1/2 of samples
-    test_forget = filter_loader_by_class(test_loader, forget_class, include_class=True,
-                                         max_samples=len(test_loader.dataset) // 2)
-    test_other = filter_loader_by_class(test_loader, forget_class, include_class=False,
-                                        max_samples=len(test_loader.dataset) // 2)
+        if targets is None:
+            # For Subset datasets, extract targets manually
+            targets = []
+            for i in range(len(loader.dataset)):
+                _, label = loader.dataset[i]
+                targets.append(label if isinstance(label, int) else label.item())
+            targets = torch.tensor(targets)
 
-    def compute_cka_for_loader(loader):
-        """Compute layer-wise CKA for a single loader."""
-        if loader is None:
-            return [[0.0] for _ in layer_names]
+        forget_indices = (targets == forget_class).nonzero(as_tuple=True)[0]
+        other_indices = (targets != forget_class).nonzero(as_tuple=True)[0]
 
-        # Get activations from both models
-        act_unlearned = get_layer_activations_for_cka(model_unlearned, loader, layer_names, device)
-        act_original = get_layer_activations_for_cka(model_original, loader, layer_names, device)
+        if is_train:
+            forget_samples = len(forget_indices) // 10
+            other_samples = len(other_indices) // 10
+        else:
+            forget_samples = len(forget_indices) // 2
+            other_samples = len(other_indices) // 2
 
-        # Compute CKA for each layer
-        cka_scores = []
-        for layer_name in layer_names:
-            if layer_name in act_unlearned and layer_name in act_original:
-                score = linear_cka(act_unlearned[layer_name], act_original[layer_name])
-                cka_scores.append([round(score, 3)])
-            else:
-                cka_scores.append([0.0])
+        # Fix random seed for consistent CKA sampling - use forget_class as part of seed
+        seed = 42 + forget_class
+        torch.manual_seed(seed)
+        np.random.seed(seed)
 
-        return cka_scores
+        # Sort indices for complete determinism (matching backend)
+        forget_indices_sorted = torch.sort(forget_indices)[0]
+        other_indices_sorted = torch.sort(other_indices)[0]
 
-    # Compute CKA for all four combinations
-    print("  Computing CKA for train/forget_class...")
-    train_forget_cka = compute_cka_for_loader(train_forget)
+        forget_sampled = forget_indices_sorted[:forget_samples]
+        other_sampled = other_indices_sorted[:other_samples]
 
-    print("  Computing CKA for train/other_classes...")
-    train_other_cka = compute_cka_for_loader(train_other)
+        forget_loader = DataLoader(
+            Subset(loader.dataset, forget_sampled.tolist()),
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=0
+        )
 
-    print("  Computing CKA for test/forget_class...")
-    test_forget_cka = compute_cka_for_loader(test_forget)
+        other_loader = DataLoader(
+            Subset(loader.dataset, other_sampled.tolist()),
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=0
+        )
 
-    print("  Computing CKA for test/other_classes...")
-    test_other_cka = compute_cka_for_loader(test_other)
+        return forget_loader, other_loader
 
-    return {
+    print("  Creating filtered data loaders...")
+    forget_class_train_loader, other_classes_train_loader = filter_loader(train_loader, is_train=True)
+    forget_class_test_loader, other_classes_test_loader = filter_loader(test_loader, is_train=False)
+
+    def format_cka_results(results):
+        """Format CKA results to match backend structure."""
+        if results is None:
+            return None
+        return [[round(float(value), 3) for value in layer_results] for layer_results in results['CKA'].tolist()]
+
+    # Set models to eval mode
+    model_original.eval()
+    model_unlearned.eval()
+
+    print("  Computing CKA similarity (original vs unlearned)...")
+
+    # Create CKA object for original vs unlearned comparison
+    cka = CKA(
+        model_original,
+        model_unlearned,
+        model1_name="Original",
+        model2_name="Unlearned",
+        model1_layers=layer_names,
+        model2_layers=layer_names,
+        device=device
+    )
+
+    with torch.no_grad():
+        # Compare on forget class train data
+        cka.compare(forget_class_train_loader, forget_class_train_loader)
+        results_forget_train = cka.export()
+
+        # Compare on other classes train data
+        cka.compare(other_classes_train_loader, other_classes_train_loader)
+        results_other_train = cka.export()
+
+        # Compare on forget class test data
+        cka.compare(forget_class_test_loader, forget_class_test_loader)
+        results_forget_test = cka.export()
+
+        # Compare on other classes test data
+        cka.compare(other_classes_test_loader, other_classes_test_loader)
+        results_other_test = cka.export()
+
+    # Build similarity result
+    similarity = {
         "layers": layer_names,
         "train": {
-            "forget_class": train_forget_cka,
-            "other_classes": train_other_cka
+            "forget_class": format_cka_results(results_forget_train),
+            "other_classes": format_cka_results(results_other_train)
         },
         "test": {
-            "forget_class": test_forget_cka,
-            "other_classes": test_other_cka
+            "forget_class": format_cka_results(results_forget_test),
+            "other_classes": format_cka_results(results_other_test)
         }
+    }
+
+    # Compute retrain comparison if retrain model provided
+    similarity_retrain = None
+    if retrain_model is not None:
+        print("  Computing CKA similarity (retrain vs unlearned)...")
+        retrain_model.eval()
+
+        cka_retrain = CKA(
+            retrain_model,
+            model_unlearned,
+            model1_name="Retrain",
+            model2_name="Unlearned",
+            model1_layers=layer_names,
+            model2_layers=layer_names,
+            device=device
+        )
+
+        with torch.no_grad():
+            cka_retrain.compare(forget_class_train_loader, forget_class_train_loader)
+            retrain_results_forget_train = cka_retrain.export()
+
+            cka_retrain.compare(other_classes_train_loader, other_classes_train_loader)
+            retrain_results_other_train = cka_retrain.export()
+
+            cka_retrain.compare(forget_class_test_loader, forget_class_test_loader)
+            retrain_results_forget_test = cka_retrain.export()
+
+            cka_retrain.compare(other_classes_test_loader, other_classes_test_loader)
+            retrain_results_other_test = cka_retrain.export()
+
+        similarity_retrain = {
+            "layers": layer_names,
+            "train": {
+                "forget_class": format_cka_results(retrain_results_forget_train),
+                "other_classes": format_cka_results(retrain_results_other_train)
+            },
+            "test": {
+                "forget_class": format_cka_results(retrain_results_forget_test),
+                "other_classes": format_cka_results(retrain_results_other_test)
+            }
+        }
+
+    return {
+        "similarity": similarity,
+        "similarity_retrain": similarity_retrain
     }
 
 
@@ -747,7 +748,8 @@ def create_results_json(
     learning_rate: float,
     runtime: float,
     device: torch.device,
-    original_model: Optional[nn.Module] = None
+    original_model: Optional[nn.Module] = None,
+    retrain_model: Optional[nn.Module] = None
 ) -> Dict[str, Any]:
     """
     Create full results JSON matching existing codebase format.
@@ -778,9 +780,9 @@ def create_results_json(
     points = prepare_umap_points(umap_subset, selected_indices, predicted_labels,
                                   umap_embedding, probs, forget_class)
 
-    # Attack metrics
+    # Attack metrics (computed on UMAP subset to match points array)
     print("Computing attack metrics...")
-    values, attack_results, fqs = compute_attack_metrics(model, train_loader, device, forget_class)
+    values, attack_results, fqs = compute_attack_metrics(model, umap_loader, device, forget_class)
 
     # CKA similarity (if original model provided)
     cka_result = None
@@ -790,45 +792,105 @@ def create_results_json(
         model_type = "vgg" if "vgg" in model_name.lower() else "resnet"
         cka_result = compute_cka_similarity(
             model, original_model, train_loader, test_loader,
-            forget_class, device, model_type
+            forget_class, device, model_type, retrain_model=retrain_model
         )
 
     # Generate unique ID
     result_id = uuid.uuid4().hex[:4]
 
+    # Compute PA (Privacy Attack) score - max attack score from entropy-based results
+    pa_score = max(r['attack_score'] for r in attack_results['entropy_above_unlearn'])
+
     # Create results dictionary
     results = {
         "CreatedAt": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "ID": result_id,
-        "FC": forget_class,           # int, not str
+        "FC": int(forget_class),           # Ensure int
         "Type": "Unlearned",
-        "Model": model_name,
         "Base": "pretrained",
         "Method": method_name,
-        "Epoch": epochs,              # int, not str
-        "BS": batch_size,             # int, not str
-        "LR": learning_rate,          # float, not str
-        "UA": round(ua, 3),
-        "RA": round(ra, 3),
-        "TUA": round(tua, 3),
-        "TRA": round(tra, 3),
-        "RTE": round(runtime, 1),
-        "FQS": fqs,
-        "accs": [round(train_class_accs[i], 3) for i in range(NUM_CLASSES)],
-        "t_accs": [round(test_class_accs[i], 3) for i in range(NUM_CLASSES)],
+        "Epoch": int(epochs),              # Ensure int
+        "BS": int(batch_size),             # Ensure int
+        "LR": float(learning_rate),        # Ensure float
+        "UA": round(float(ua), 3),         # Ensure float, rounded
+        "RA": round(float(ra), 3),
+        "TUA": round(float(tua), 3),
+        "TRA": round(float(tra), 3),
+        "RTE": round(float(runtime), 1),
+        "FQS": float(fqs),                 # Ensure float
+        "PA": round(float(pa_score), 4),
+        "accs": [round(float(train_class_accs[i]), 3) for i in range(NUM_CLASSES)],
+        "t_accs": [round(float(test_class_accs[i]), 3) for i in range(NUM_CLASSES)],
         "label_dist": format_distribution(train_label_dist),
         "t_label_dist": format_distribution(test_label_dist),
         "conf_dist": format_distribution(train_conf_dist),
         "t_conf_dist": format_distribution(test_conf_dist),
         "points": points,
         "attack": {
-            "values": values[:200],  # Limit to first 200 for UMAP subset
+            "values": values,  # All 2000 values from UMAP subset
             "results": attack_results
         }
     }
 
     if cka_result:
-        results["cka"] = cka_result
+        # Extract similarity results from new format
+        results["cka"] = cka_result["similarity"]
+        # Use actual retrain CKA if available, otherwise placeholder
+        if cka_result["similarity_retrain"] is not None:
+            results["cka_retrain"] = cka_result["similarity_retrain"]
+        else:
+            # Add placeholder retrain CKA (zeros since no retrain model available)
+            results["cka_retrain"] = {
+                "layers": cka_result["similarity"]["layers"],
+                "train": {
+                    "forget_class": [[0.0] for _ in cka_result["similarity"]["layers"]],
+                    "other_classes": [[0.0] for _ in cka_result["similarity"]["layers"]]
+                },
+                "test": {
+                    "forget_class": [[0.0] for _ in cka_result["similarity"]["layers"]],
+                    "other_classes": [[0.0] for _ in cka_result["similarity"]["layers"]]
+                }
+            }
+    else:
+        # Provide default CKA structure for frontend compatibility
+        model_type = "vgg" if "vgg" in model_name.lower() else "resnet"
+        layer_names = VGG_LAYERS if model_type == "vgg" else RESNET_LAYERS
+        results["cka"] = {
+            "layers": layer_names,
+            "train": {
+                "forget_class": [[0.0] for _ in layer_names],
+                "other_classes": [[0.0] for _ in layer_names]
+            },
+            "test": {
+                "forget_class": [[0.0] for _ in layer_names],
+                "other_classes": [[0.0] for _ in layer_names]
+            }
+        }
+        results["cka_retrain"] = {
+            "layers": layer_names,
+            "train": {
+                "forget_class": [[0.0] for _ in layer_names],
+                "other_classes": [[0.0] for _ in layer_names]
+            },
+            "test": {
+                "forget_class": [[0.0] for _ in layer_names],
+                "other_classes": [[0.0] for _ in layer_names]
+            }
+        }
+
+    # Validate points array structure before returning
+    if points:
+        for i, p in enumerate(points):
+            if not isinstance(p, list) or len(p) != 7:
+                raise ValueError(f"Invalid point at index {i}: expected 7 elements, got {len(p) if isinstance(p, list) else 'not a list'}")
+            # Ensure numeric types are JSON-serializable
+            p[0] = int(p[0])  # gt
+            p[1] = int(p[1])  # pred
+            p[2] = int(p[2])  # idx
+            p[3] = int(p[3])  # is_forget
+            p[4] = float(p[4])  # x
+            p[5] = float(p[5])  # y
+            # p[6] is prob_dict, already correct type
 
     return results
 
@@ -836,31 +898,37 @@ def create_results_json(
 def save_results(
     result: Dict[str, Any],
     model: nn.Module,
-    output_dir: str = "notebook_results"
+    model_name: str,
+    forget_class: int,
+    output_dir: str = "backend/data"
 ) -> str:
     """
     Save results JSON and model weights.
 
+    Args:
+        result: Results dictionary
+        model: The model to save weights for
+        model_name: Name of the model (e.g., "ResNet-18", "VGG-16-BN")
+        forget_class: The forget class (0-9)
+        output_dir: Output directory path
+
     Returns:
         Path to saved JSON file
     """
-    model_name = result.get("Model", "Unknown")
-    method_name = result.get("Method", "Unknown")
     result_id = result.get("ID", "0000")
-
     output_dir = os.path.abspath(output_dir)
-    
-    # Create output directory
-    model_dir = os.path.join(output_dir, model_name)
-    os.makedirs(model_dir, exist_ok=True)
 
-    # Save JSON
-    json_path = os.path.join(model_dir, f"{method_name}_{result_id}.json")
+    # Create output directory: backend/data/{forget_class}/
+    class_dir = os.path.join(output_dir, str(forget_class))
+    os.makedirs(class_dir, exist_ok=True)
+
+    # Save JSON as {id}.json
+    json_path = os.path.join(class_dir, f"{result_id}.json")
     with open(json_path, 'w') as f:
         json.dump(result, f, indent=2, default=float)
 
-    # Save model weights
-    weights_path = os.path.join(model_dir, f"{method_name}_{result_id}.pth")
+    # Save model weights with model name for identification
+    weights_path = os.path.join(class_dir, f"{model_name}_{result_id}.pth")
     torch.save(model.state_dict(), weights_path)
 
     print(f"Results saved to: {json_path}")
