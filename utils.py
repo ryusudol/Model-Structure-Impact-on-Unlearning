@@ -593,6 +593,29 @@ def compute_attack_metrics(
 # CKA Similarity (Layer-wise)
 # ============================================================================
 
+def _check_model_has_nan(model: nn.Module) -> bool:
+    """Check if model has any NaN or Inf values in its parameters."""
+    for param in model.parameters():
+        if torch.isnan(param).any() or torch.isinf(param).any():
+            return True
+    return False
+
+
+def _get_default_cka_result(layer_names: List[str]) -> Dict[str, Any]:
+    """Return a default CKA result structure with NaN values indicating computation failure."""
+    return {
+        "layers": layer_names,
+        "train": {
+            "forget_class": [[float('nan')] for _ in layer_names],
+            "other_classes": [[float('nan')] for _ in layer_names]
+        },
+        "test": {
+            "forget_class": [[float('nan')] for _ in layer_names],
+            "other_classes": [[float('nan')] for _ in layer_names]
+        }
+    }
+
+
 def compute_cka_similarity(
     model_unlearned: nn.Module,
     model_original: nn.Module,
@@ -628,6 +651,14 @@ def compute_cka_similarity(
     """
     # Select layer names based on model type
     layer_names = RESNET_LAYERS if model_type.lower() == "resnet" else VGG_LAYERS
+
+    # Check for NaN/Inf values in model weights (can happen with aggressive unlearning like Gradient Ascent)
+    if _check_model_has_nan(model_unlearned):
+        print("  WARNING: Unlearned model contains NaN/Inf values. Skipping CKA computation.")
+        return {
+            "similarity": _get_default_cka_result(layer_names),
+            "similarity_retrain": None
+        }
 
     def filter_loader(loader, is_train=False):
         """Filter loader to create forget_class and other_classes loaders."""
@@ -706,35 +737,41 @@ def compute_cka_similarity(
         device=device
     )
 
-    with torch.no_grad():
-        # Compare on forget class train data
-        cka.compare(forget_class_train_loader, forget_class_train_loader)
-        results_forget_train = cka.export()
+    try:
+        with torch.no_grad():
+            # Compare on forget class train data
+            cka.compare(forget_class_train_loader, forget_class_train_loader)
+            results_forget_train = cka.export()
 
-        # Compare on other classes train data
-        cka.compare(other_classes_train_loader, other_classes_train_loader)
-        results_other_train = cka.export()
+            # Compare on other classes train data
+            cka.compare(other_classes_train_loader, other_classes_train_loader)
+            results_other_train = cka.export()
 
-        # Compare on forget class test data
-        cka.compare(forget_class_test_loader, forget_class_test_loader)
-        results_forget_test = cka.export()
+            # Compare on forget class test data
+            cka.compare(forget_class_test_loader, forget_class_test_loader)
+            results_forget_test = cka.export()
 
-        # Compare on other classes test data
-        cka.compare(other_classes_test_loader, other_classes_test_loader)
-        results_other_test = cka.export()
+            # Compare on other classes test data
+            cka.compare(other_classes_test_loader, other_classes_test_loader)
+            results_other_test = cka.export()
 
-    # Build similarity result
-    similarity = {
-        "layers": layer_names,
-        "train": {
-            "forget_class": format_cka_results(results_forget_train),
-            "other_classes": format_cka_results(results_other_train)
-        },
-        "test": {
-            "forget_class": format_cka_results(results_forget_test),
-            "other_classes": format_cka_results(results_other_test)
+        # Build similarity result
+        similarity = {
+            "layers": layer_names,
+            "train": {
+                "forget_class": format_cka_results(results_forget_train),
+                "other_classes": format_cka_results(results_other_train)
+            },
+            "test": {
+                "forget_class": format_cka_results(results_forget_test),
+                "other_classes": format_cka_results(results_other_test)
+            }
         }
-    }
+    except (AssertionError, RuntimeError) as e:
+        # Handle NaN in HSIC computation (can happen with aggressive unlearning)
+        print(f"  WARNING: CKA computation failed: {e}")
+        print("  Returning default CKA result with NaN values.")
+        similarity = _get_default_cka_result(layer_names)
 
     # Compute retrain comparison if retrain model provided
     similarity_retrain = None
@@ -752,30 +789,36 @@ def compute_cka_similarity(
             device=device
         )
 
-        with torch.no_grad():
-            cka_retrain.compare(forget_class_train_loader, forget_class_train_loader)
-            retrain_results_forget_train = cka_retrain.export()
+        try:
+            with torch.no_grad():
+                cka_retrain.compare(forget_class_train_loader, forget_class_train_loader)
+                retrain_results_forget_train = cka_retrain.export()
 
-            cka_retrain.compare(other_classes_train_loader, other_classes_train_loader)
-            retrain_results_other_train = cka_retrain.export()
+                cka_retrain.compare(other_classes_train_loader, other_classes_train_loader)
+                retrain_results_other_train = cka_retrain.export()
 
-            cka_retrain.compare(forget_class_test_loader, forget_class_test_loader)
-            retrain_results_forget_test = cka_retrain.export()
+                cka_retrain.compare(forget_class_test_loader, forget_class_test_loader)
+                retrain_results_forget_test = cka_retrain.export()
 
-            cka_retrain.compare(other_classes_test_loader, other_classes_test_loader)
-            retrain_results_other_test = cka_retrain.export()
+                cka_retrain.compare(other_classes_test_loader, other_classes_test_loader)
+                retrain_results_other_test = cka_retrain.export()
 
-        similarity_retrain = {
-            "layers": layer_names,
-            "train": {
-                "forget_class": format_cka_results(retrain_results_forget_train),
-                "other_classes": format_cka_results(retrain_results_other_train)
-            },
-            "test": {
-                "forget_class": format_cka_results(retrain_results_forget_test),
-                "other_classes": format_cka_results(retrain_results_other_test)
+            similarity_retrain = {
+                "layers": layer_names,
+                "train": {
+                    "forget_class": format_cka_results(retrain_results_forget_train),
+                    "other_classes": format_cka_results(retrain_results_other_train)
+                },
+                "test": {
+                    "forget_class": format_cka_results(retrain_results_forget_test),
+                    "other_classes": format_cka_results(retrain_results_other_test)
+                }
             }
-        }
+        except (AssertionError, RuntimeError) as e:
+            # Handle NaN in HSIC computation
+            print(f"  WARNING: Retrain CKA computation failed: {e}")
+            print("  Returning default CKA result with NaN values.")
+            similarity_retrain = _get_default_cka_result(layer_names)
 
     return {
         "similarity": similarity,
