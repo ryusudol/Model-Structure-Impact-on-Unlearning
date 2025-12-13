@@ -84,6 +84,27 @@ def get_vgg16bn():
     return model
 
 
+def get_resnet18_scratch():
+    """Initialize ResNet-18 with random weights for CIFAR-10."""
+    from torchvision import models
+
+    print("  Initializing ResNet-18 with random weights...")
+    model = models.resnet18(weights=None)
+    model.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
+    model.maxpool = nn.Identity()
+    model.fc = nn.Linear(model.fc.in_features, NUM_CLASSES)
+    print("  Model initialized successfully.")
+    return model
+
+
+def get_vgg16bn_scratch():
+    """Initialize VGG-16-BN with random weights for CIFAR-10."""
+    print("  Initializing VGG16-BN with random weights...")
+    model = timm.create_model("vgg16_bn_cifar10", pretrained=False)
+    print("  Model initialized successfully.")
+    return model
+
+
 # ============================================================================
 # Data Loading
 # ============================================================================
@@ -163,6 +184,44 @@ def get_umap_subset(
     loader = DataLoader(subset, batch_size=num_samples, shuffle=False)
 
     return subset, loader, selected_indices
+
+
+def get_augmented_retain_loader(
+    batch_size: int,
+    forget_class: int,
+    data_dir: str = './data'
+) -> DataLoader:
+    """
+    Create retain loader with data augmentation for training from scratch.
+
+    Args:
+        batch_size: Batch size for training
+        forget_class: Class to exclude from training data
+        data_dir: Directory for CIFAR-10 data
+
+    Returns:
+        DataLoader with augmented retain data (excludes forget_class)
+    """
+    torch.manual_seed(SEED)
+    np.random.seed(SEED)
+
+    transform_train = transforms.Compose([
+        transforms.RandomCrop(32, padding=4),
+        transforms.RandomHorizontalFlip(),
+        transforms.ToTensor(),
+        transforms.Normalize(CIFAR10_MEAN, CIFAR10_STD)
+    ])
+
+    train_set = datasets.CIFAR10(root=data_dir, train=True, download=True, transform=transform_train)
+    train_targets = torch.tensor(train_set.targets)
+    retain_indices = (train_targets != forget_class).nonzero(as_tuple=True)[0].tolist()
+    retain_set = Subset(train_set, retain_indices)
+
+    g = torch.Generator()
+    g.manual_seed(SEED)
+    retain_loader = DataLoader(retain_set, batch_size=batch_size, shuffle=True, num_workers=0, generator=g)
+
+    return retain_loader
 
 
 # ============================================================================
