@@ -78,8 +78,8 @@ def get_resnet18():
 
 
 def get_vgg16bn():
-    print("  Downloading VGG16-BN weights from timm...")
-    model = timm.create_model("vgg16_bn", pretrained=True, num_classes=NUM_CLASSES)
+    print("  Loading VGG16-BN pretrained on CIFAR-10 (via timm)...")
+    model = timm.create_model("vgg16_bn_cifar10", pretrained=True)
     print("  Model loaded successfully.")
     return model
 
